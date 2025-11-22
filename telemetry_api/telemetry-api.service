@@ -1,0 +1,16 @@
+[Unit]
+Description=Home Telemetry API Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Telemetry/telemetry_api
+Environment="PATH=/home/pi/Telemetry/telemetry_api/venv/bin"
+ExecStart=/home/pi/Telemetry/telemetry_api/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
