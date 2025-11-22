@@ -1,204 +1,186 @@
-"""
-Home Telemetry API for Raspberry Pi Zero 2 W
-FastAPI server exposing system telemetry data as JSON endpoints.
-"""
-
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from telemetry_readers import (
-    get_all_telemetry,
-    get_cpu_temperature,
-    get_wifi_signal,
-    get_wifi_signal_iwconfig,
-    get_uptime,
-    get_load_average,
-    get_memory_info
-)
+from pydantic import BaseModel
+from typing import Dict, Optional, Union
+import subprocess
+import platform
+import telemetry_readers
 
-# Initialize FastAPI app
 app = FastAPI(
     title="Home Telemetry API",
-    description="Raspberry Pi Zero 2 W system telemetry monitoring API",
-    version="1.0.0"
+    description="API for Raspberry Pi system monitoring and control",
+    version="1.1.0"
 )
 
-# Configure CORS to allow Flutter apps to access the API
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins - restrict this in production
+    allow_origins=["*"],  # In production, replace with specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- Data Models ---
 
-@app.get("/")
+class CpuData(BaseModel):
+    temperature_celsius: Optional[float]
+    usage_percent: float
+
+class WifiData(BaseModel):
+    signal_level_dbm: Optional[int]
+    signal_quality_percent: Optional[float]
+
+class LoadAverage(BaseModel):
+    load_1min: float
+    load_5min: float
+    load_15min: float
+
+class ThrottlingData(BaseModel):
+    is_throttled: bool
+    under_voltage: bool
+    frequency_capped: bool
+    overheated: bool
+
+class SystemInfo(BaseModel):
+    hostname: str
+    os: str
+    kernel: str
+    ip_address: str
+
+class SystemData(BaseModel):
+    uptime_seconds: float
+    uptime_hours: float
+    load_average: LoadAverage
+    info: SystemInfo
+    throttling: ThrottlingData
+
+class MemoryData(BaseModel):
+    total_mb: float
+    free_mb: float
+    available_mb: float
+    used_mb: float
+    used_percent: float
+
+class DiskData(BaseModel):
+    total_gb: float
+    used_gb: float
+    free_gb: float
+    percent: float
+
+class NetworkData(BaseModel):
+    interface: str
+    bytes_recv: int
+    bytes_sent: int
+
+class TelemetryResponse(BaseModel):
+    cpu: CpuData
+    wifi: WifiData
+    system: SystemData
+    memory: MemoryData
+    disk: DiskData
+    network: NetworkData
+
+class ApiResponse(BaseModel):
+    status: str
+    data: Optional[TelemetryResponse] = None
+    message: Optional[str] = None
+
+# --- Endpoints ---
+
+@app.get("/", tags=["General"])
 async def root():
-    """Root endpoint with API information."""
     return {
         "name": "Home Telemetry API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "description": "Raspberry Pi system monitoring API",
         "endpoints": {
-            "telemetry": "/telemetry - All telemetry data",
-            "cpu": "/telemetry/cpu - CPU temperature",
-            "wifi": "/telemetry/wifi - Wi-Fi signal strength",
-            "system": "/telemetry/system - System uptime and load",
-            "memory": "/telemetry/memory - Memory information",
-            "docs": "/docs - API documentation"
+            "/telemetry": "Get all telemetry data",
+            "/telemetry/cpu": "Get CPU data",
+            "/telemetry/memory": "Get memory data",
+            "/telemetry/disk": "Get disk usage",
+            "/telemetry/network": "Get network stats",
+            "/control/reboot": "Reboot the system (POST)",
+            "/control/shutdown": "Shutdown the system (POST)"
         }
     }
 
-
-@app.get("/health")
+@app.get("/health", tags=["General"])
 async def health_check():
-    """Health check endpoint."""
+    return {"status": "healthy", "service": "telemetry-api"}
+
+@app.get("/telemetry", response_model=ApiResponse, tags=["Telemetry"])
+async def get_telemetry():
+    try:
+        data = telemetry_readers.get_all_telemetry()
+        return {"status": "success", "data": data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/telemetry/cpu", tags=["Telemetry"])
+async def get_cpu():
     return {
-        "status": "healthy",
-        "service": "telemetry-api"
+        "temperature_celsius": telemetry_readers.get_cpu_temperature(),
+        "usage_percent": telemetry_readers.get_cpu_usage()
     }
 
+@app.get("/telemetry/memory", tags=["Telemetry"])
+async def get_memory():
+    return telemetry_readers.get_memory_info()
 
-@app.get("/telemetry")
-async def get_telemetry():
-    """
-    Get all system telemetry data.
-    
-    Returns:
-        JSON object containing CPU temperature, Wi-Fi signal,
-        system uptime/load, and memory information.
-    """
+@app.get("/telemetry/disk", tags=["Telemetry"])
+async def get_disk():
+    return telemetry_readers.get_disk_usage()
+
+@app.get("/telemetry/network", tags=["Telemetry"])
+async def get_network():
+    return telemetry_readers.get_network_stats()
+
+@app.post("/control/reboot", tags=["Control"])
+async def reboot_system():
+    # Check if running on Linux (Raspberry Pi)
+    if platform.system() != "Linux":
+        return {"status": "success", "message": "Simulated reboot (not on Linux)"}
+
     try:
-        telemetry_data = get_all_telemetry()
-        return JSONResponse(content={
-            "status": "success",
-            "data": telemetry_data
-        })
+        # This requires sudo privileges without password for the user running the service
+        # Using full path to sudo for safety
+        subprocess.run(["/usr/bin/sudo", "reboot"], check=True)
+        return {"status": "success", "message": "System is rebooting..."}
+    except FileNotFoundError:
+        # Fallback if /usr/bin/sudo is not found, try just 'sudo'
+        try:
+            subprocess.run(["sudo", "reboot"], check=True)
+            return {"status": "success", "message": "System is rebooting..."}
+        except FileNotFoundError:
+             raise HTTPException(status_code=500, detail="Command 'sudo' not found. Cannot reboot.")
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reboot: {e}")
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/control/shutdown", tags=["Control"])
+async def shutdown_system():
+    # Check if running on Linux (Raspberry Pi)
+    if platform.system() != "Linux":
+        return {"status": "success", "message": "Simulated shutdown (not on Linux)"}
 
-@app.get("/telemetry/cpu")
-async def get_cpu_telemetry():
-    """
-    Get CPU telemetry data.
-    
-    Returns:
-        JSON object with CPU temperature in Celsius.
-    """
     try:
-        temp = get_cpu_temperature()
-        return JSONResponse(content={
-            "status": "success",
-            "data": {
-                "temperature_celsius": temp
-            }
-        })
+        # This requires sudo privileges without password for the user running the service
+        subprocess.run(["/usr/bin/sudo", "shutdown", "-h", "now"], check=True)
+        return {"status": "success", "message": "System is shutting down..."}
+    except FileNotFoundError:
+        # Fallback
+        try:
+            subprocess.run(["sudo", "shutdown", "-h", "now"], check=True)
+            return {"status": "success", "message": "System is shutting down..."}
+        except FileNotFoundError:
+             raise HTTPException(status_code=500, detail="Command 'sudo' not found. Cannot shutdown.")
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to shutdown: {e}")
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
-
-
-@app.get("/telemetry/wifi")
-async def get_wifi_telemetry():
-    """
-    Get Wi-Fi telemetry data.
-    
-    Returns:
-        JSON object with Wi-Fi signal level (dBm) and quality (%).
-    """
-    try:
-        wifi_data = get_wifi_signal()
-        if wifi_data["signal_level"] is None:
-            # Try iwconfig as fallback
-            wifi_data = get_wifi_signal_iwconfig()
-        
-        return JSONResponse(content={
-            "status": "success",
-            "data": {
-                "signal_level_dbm": wifi_data["signal_level"],
-                "signal_quality_percent": wifi_data["signal_quality"]
-            }
-        })
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
-
-
-@app.get("/telemetry/system")
-async def get_system_telemetry():
-    """
-    Get system telemetry data.
-    
-    Returns:
-        JSON object with uptime and load average.
-    """
-    try:
-        uptime_data = get_uptime()
-        load_data = get_load_average()
-        
-        return JSONResponse(content={
-            "status": "success",
-            "data": {
-                "uptime_seconds": uptime_data["uptime_seconds"],
-                "uptime_hours": round(uptime_data["uptime_seconds"] / 3600, 2),
-                "load_average": load_data
-            }
-        })
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
-
-
-@app.get("/telemetry/memory")
-async def get_memory_telemetry():
-    """
-    Get memory telemetry data.
-    
-    Returns:
-        JSON object with memory statistics in MB.
-    """
-    try:
-        memory_data = get_memory_info()
-        
-        return JSONResponse(content={
-            "status": "success",
-            "data": memory_data
-        })
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    # Run with: python main.py
-    # Or use: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,11 +1,14 @@
 """
 Telemetry reader functions for Raspberry Pi system monitoring.
-Reads CPU temperature, Wi-Fi signal, system uptime, and memory information.
+Reads CPU temperature, Wi-Fi signal, system uptime, memory, disk usage, and more.
 """
 
 import os
 import subprocess
-from typing import Dict, Optional
+import socket
+import platform
+import time
+from typing import Dict, Optional, Tuple
 
 
 def get_cpu_temperature() -> Optional[float]:
@@ -207,6 +210,189 @@ def get_memory_info() -> Dict[str, float]:
         return result
 
 
+def get_disk_usage() -> Dict[str, float]:
+    """
+    Get disk usage statistics for the root partition.
+    
+    Returns:
+        Dictionary with total, used, free (in GB) and percent used.
+    """
+    try:
+        stat = os.statvfs('/')
+        total = stat.f_blocks * stat.f_frsize
+        free = stat.f_bavail * stat.f_frsize
+        used = total - free
+        
+        total_gb = total / (1024 ** 3)
+        used_gb = used / (1024 ** 3)
+        free_gb = free / (1024 ** 3)
+        percent = (used / total) * 100 if total > 0 else 0
+        
+        return {
+            "total_gb": round(total_gb, 2),
+            "used_gb": round(used_gb, 2),
+            "free_gb": round(free_gb, 2),
+            "percent": round(percent, 1)
+        }
+    except OSError as e:
+        print(f"Error reading disk usage: {e}")
+        return {"total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "percent": 0.0}
+
+
+def get_system_info() -> Dict[str, str]:
+    """
+    Get static system information.
+    
+    Returns:
+        Dictionary with hostname, os, kernel, and ip.
+    """
+    try:
+        hostname = socket.gethostname()
+        
+        # Get IP address (try to find a non-localhost one)
+        ip_address = "127.0.0.1"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Doesn't need to be reachable
+            s.connect(('10.255.255.255', 1))
+            ip_address = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
+        return {
+            "hostname": hostname,
+            "os": f"{platform.system()} {platform.release()}",
+            "kernel": platform.version(),
+            "ip_address": ip_address
+        }
+    except Exception as e:
+        print(f"Error getting system info: {e}")
+        return {"hostname": "Unknown", "os": "Unknown", "kernel": "Unknown", "ip_address": "Unknown"}
+
+
+def get_cpu_usage() -> float:
+    """
+    Calculate CPU usage percentage.
+    Note: This is a blocking call for a short duration (0.1s) to calculate diff.
+    For a production API, this might be better handled in a background thread or 
+    by reading /proc/stat and storing state. For simplicity here, we block briefly.
+    
+    Returns:
+        CPU usage percentage (0.0 to 100.0)
+    """
+    try:
+        # First read
+        with open('/proc/stat', 'r') as f:
+            line1 = f.readline()
+        
+        time.sleep(0.1)
+        
+        # Second read
+        with open('/proc/stat', 'r') as f:
+            line2 = f.readline()
+            
+        def parse_stat(line):
+            parts = line.split()
+            # parts[0] is 'cpu'
+            # parts[1-7] are user, nice, system, idle, iowait, irq, softirq
+            if len(parts) < 5: return 0, 0
+            total = sum(int(x) for x in parts[1:])
+            idle = int(parts[4])
+            return total, idle
+            
+        total1, idle1 = parse_stat(line1)
+        total2, idle2 = parse_stat(line2)
+        
+        diff_total = total2 - total1
+        diff_idle = idle2 - idle1
+        
+        if diff_total == 0: return 0.0
+        
+        usage = ((diff_total - diff_idle) / diff_total) * 100
+        return round(usage, 1)
+        
+    except Exception as e:
+        print(f"Error reading CPU usage: {e}")
+        return 0.0
+
+
+def get_throttling_status() -> Dict[str, bool]:
+    """
+    Check for throttling (under-voltage, frequency capping) using vcgencmd.
+    
+    Returns:
+        Dictionary with boolean flags for different throttling states.
+    """
+    result = {
+        "is_throttled": False,
+        "under_voltage": False,
+        "frequency_capped": False,
+        "overheated": False
+    }
+    
+    try:
+        # vcgencmd get_throttled returns hex, e.g., throttled=0x50000
+        output = subprocess.check_output(['vcgencmd', 'get_throttled'], stderr=subprocess.DEVNULL, text=True)
+        if '=' in output:
+            hex_str = output.split('=')[1].strip()
+            status = int(hex_str, 16)
+            
+            # Bit definitions from Raspberry Pi documentation
+            result["under_voltage"] = bool(status & 0x1)
+            result["frequency_capped"] = bool(status & 0x2)
+            result["overheated"] = bool(status & 0x4)
+            result["is_throttled"] = status > 0
+            
+        return result
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # vcgencmd might not be available on non-Pi systems
+        return result
+
+
+def get_network_stats() -> Dict[str, int]:
+    """
+    Get network statistics (bytes sent/received).
+    
+    Returns:
+        Dictionary with bytes_sent and bytes_recv.
+    """
+    try:
+        # Try to find the main interface (usually wlan0 or eth0)
+        interfaces = ['wlan0', 'eth0', 'en0'] # en0 for mac testing
+        target_iface = None
+        
+        with open('/proc/net/dev', 'r') as f:
+            lines = f.readlines()
+            
+        for line in lines[2:]:
+            iface = line.split(':')[0].strip()
+            if iface in interfaces:
+                target_iface = iface
+                data = line.split(':')[1].split()
+                return {
+                    "interface": iface,
+                    "bytes_recv": int(data[0]),
+                    "bytes_sent": int(data[8])
+                }
+        
+        # If no specific interface found, just return the first non-lo one
+        for line in lines[2:]:
+            iface = line.split(':')[0].strip()
+            if iface != 'lo':
+                data = line.split(':')[1].split()
+                return {
+                    "interface": iface,
+                    "bytes_recv": int(data[0]),
+                    "bytes_sent": int(data[8])
+                }
+                
+        return {"interface": "none", "bytes_recv": 0, "bytes_sent": 0}
+        
+    except (FileNotFoundError, IndexError, ValueError):
+        return {"interface": "none", "bytes_recv": 0, "bytes_sent": 0}
+
+
 def get_all_telemetry() -> Dict:
     """
     Collect all telemetry data.
@@ -223,10 +409,16 @@ def get_all_telemetry() -> Dict:
     uptime_data = get_uptime()
     memory_data = get_memory_info()
     load_data = get_load_average()
+    disk_data = get_disk_usage()
+    system_info = get_system_info()
+    cpu_usage = get_cpu_usage()
+    throttling = get_throttling_status()
+    network = get_network_stats()
     
     return {
         "cpu": {
             "temperature_celsius": get_cpu_temperature(),
+            "usage_percent": cpu_usage,
         },
         "wifi": {
             "signal_level_dbm": wifi_data["signal_level"],
@@ -236,6 +428,10 @@ def get_all_telemetry() -> Dict:
             "uptime_seconds": uptime_data["uptime_seconds"],
             "uptime_hours": round(uptime_data["uptime_seconds"] / 3600, 2),
             "load_average": load_data,
+            "info": system_info,
+            "throttling": throttling,
         },
         "memory": memory_data,
+        "disk": disk_data,
+        "network": network,
     }
