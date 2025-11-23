@@ -1,18 +1,25 @@
 # Task List
 
-- [ ] Plan Enhancements
-    - [ ] Create implementation plan <!-- id: 0 -->
-- [ ] Update Telemetry API <!-- id: 1 -->
-    - [ ] Implement Disk Usage reader <!-- id: 2 -->
-    - [ ] Implement System Info reader <!-- id: 3 -->
-    - [ ] Implement Control endpoints (Reboot, Shutdown) <!-- id: 4 -->
-    - [ ] Update `main.py` to expose new endpoints <!-- id: 5 -->
-- [ ] Update Flutter App <!-- id: 6 -->
-    - [ ] Update `TelemetryData` model <!-- id: 7 -->
-    - [ ] Update `TelemetryService` <!-- id: 8 -->
-    - [ ] Add Control buttons (Reboot/Shutdown) with confirmation <!-- id: 9 -->
-    - [ ] Add Disk Usage and System Info widgets <!-- id: 10 -->
-- [ ] Verify and Document <!-- id: 11 -->
-    - [ ] Verify API changes <!-- id: 12 -->
-    - [ ] Verify Flutter UI <!-- id: 13 -->
-    - [ ] Update Documentation <!-- id: 14 -->
+- [x] Plan New Features
+    - [x] Create implementation plan <!-- id: 0 -->
+- [x] Network Discovery <!-- id: 1 -->
+    - [x] Add `nsd` or `multicast_dns` dependency to Flutter <!-- id: 2 -->
+    - [x] Implement mDNS discovery service in Flutter <!-- id: 3 -->
+    - [x] Add "Scan for Devices" button on Home/Settings <!-- id: 4 -->
+- [x] Historical Graphs <!-- id: 5 -->
+    - [x] Add `fl_chart` dependency <!-- id: 6 -->
+    - [x] Update `TelemetryService` to maintain history buffer <!-- id: 7 -->
+    - [x] Create `HistoryGraph` widget <!-- id: 8 -->
+    - [x] Add graphs to Home Screen (expandable or new tab) <!-- id: 9 -->
+- [x] Smart Alerts <!-- id: 10 -->
+    - [x] Implement threshold checking logic <!-- id: 11 -->
+    - [x] Add in-app notifications (SnackBars/Banners) <!-- id: 12 -->
+    - [x] Add settings to toggle alerts <!-- id: 13 -->
+- [x] WebSocket Migration <!-- id: 14 -->
+    - [x] Update API with `websocket_endpoint` <!-- id: 15 -->
+    - [x] Add `web_socket_channel` to Flutter <!-- id: 16 -->
+    - [x] Update `TelemetryService` to stream data <!-- id: 17 -->
+    - [x] Update `HomeScreen` to use StreamBuilder <!-- id: 18 -->
+- [ ] Verify and Document <!-- id: 19 -->
+    - [ ] Verify WebSocket connection <!-- id: 20 -->
+    - [ ] Update Walkthrough <!-- id: 21 -->

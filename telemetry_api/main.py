@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional, Union
@@ -101,9 +102,26 @@ async def root():
             "/telemetry/disk": "Get disk usage",
             "/telemetry/network": "Get network stats",
             "/control/reboot": "Reboot the system (POST)",
-            "/control/shutdown": "Shutdown the system (POST)"
+            "/control/shutdown": "Shutdown the system (POST)",
+            "/ws": "WebSocket for real-time telemetry"
         }
     }
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = telemetry_readers.get_all_telemetry()
+            await websocket.send_json(data)
+            await asyncio.sleep(2)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 @app.get("/health", tags=["General"])
 async def health_check():

@@ -4,6 +4,8 @@ import 'package:google_fonts/google_fonts.dart';
 import '../models/telemetry_data.dart';
 import '../services/telemetry_service.dart';
 import '../widgets/telemetry_card.dart';
+import '../widgets/history_graph.dart';
+import 'package:nsd/nsd.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -13,84 +15,228 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final TextEditingController _ipController = TextEditingController(text: 'http://localhost:8000');
+  final TextEditingController _ipController = TextEditingController(
+    text: 'http://192.168.20.18:8000',
+  );
   late TelemetryService _service;
   TelemetryData? _data;
   TelemetryData? _previousData; // For calculating network speed
   bool _isLoading = false;
   String? _error;
-  Timer? _timer;
 
+  StreamSubscription<TelemetryData>? _subscription;
+
+  // History Data
+  final List<double> _cpuHistory = [];
+  final List<double> _memoryHistory = [];
+  final List<double> _tempHistory = [];
+  DateTime? _lastAlertTime;
 
   @override
   void initState() {
     super.initState();
     _service = TelemetryService(baseUrl: _ipController.text);
-    _loadData();
-    _timer = Timer.periodic(const Duration(seconds: 2), (_) => _loadData(silent: true));
+    _connectStream();
+  }
+
+  void _connectStream() {
+    _subscription?.cancel();
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      _subscription = _service.getTelemetryStream().listen(
+        (data) {
+          if (mounted) {
+            setState(() {
+              _previousData = _data;
+              _data = data;
+              _isLoading = false;
+              _error = null;
+
+              // Update History
+              if (_cpuHistory.length >= 30) _cpuHistory.removeAt(0);
+              _cpuHistory.add(data.cpu.usagePercent);
+
+              if (_memoryHistory.length >= 30) _memoryHistory.removeAt(0);
+              _memoryHistory.add(data.memory.usedPercent);
+
+              if (_tempHistory.length >= 30) _tempHistory.removeAt(0);
+              _tempHistory.add(data.cpu.temperatureCelsius ?? 0);
+
+              _checkAlerts(data);
+            });
+          }
+        },
+        onError: (error) {
+          if (mounted) {
+            setState(() {
+              _error = error.toString();
+              _isLoading = false;
+            });
+            // Retry after 5 seconds
+            Future.delayed(const Duration(seconds: 5), _connectStream);
+          }
+        },
+      );
+    } catch (e) {
+      setState(() {
+        _error = e.toString();
+        _isLoading = false;
+      });
+    }
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _subscription?.cancel();
     _ipController.dispose();
     super.dispose();
   }
 
-  Future<void> _loadData({bool silent = false}) async {
-    if (!silent) {
-      setState(() {
-        _isLoading = true;
-        _error = null;
-      });
+  void _checkAlerts(TelemetryData data) {
+    if (_lastAlertTime != null &&
+        DateTime.now().difference(_lastAlertTime!) <
+            const Duration(minutes: 1)) {
+      return;
     }
 
+    String? alertMessage;
+    if ((data.cpu.temperatureCelsius ?? 0) > 80) {
+      alertMessage =
+          'Warning: High CPU Temperature (${data.cpu.temperatureCelsius}°C)';
+    } else if (data.disk.percent > 90) {
+      alertMessage = 'Warning: Disk Usage High (${data.disk.percent}%)';
+    } else if (data.system.throttling.isThrottled) {
+      alertMessage = 'Warning: System Throttling Detected';
+    }
+
+    if (alertMessage != null && mounted) {
+      _lastAlertTime = DateTime.now();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(alertMessage),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _scanForDevices() async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => const Center(child: CircularProgressIndicator()),
+    );
+
     try {
-      final data = await _service.getTelemetry();
-      if (mounted) {
-        setState(() {
-          _previousData = _data;
-          _data = data;
-          _isLoading = false;
-          _error = null;
-        });
-      }
+      final services = await TelemetryService.findDevices();
+      if (mounted) Navigator.pop(context); // Pop loading
+
+      if (!mounted) return;
+
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: const Color(0xFF1E1E1E),
+        builder: (context) => Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Discovered Devices',
+                style: GoogleFonts.outfit(color: Colors.white, fontSize: 18),
+              ),
+              const SizedBox(height: 16),
+              if (services.isEmpty)
+                const Text(
+                  'No devices found',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ...services.map(
+                (s) => ListTile(
+                  title: Text(
+                    s.name ?? 'Unknown',
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                  subtitle: Text(
+                    '${s.host}:${s.port}',
+                    style: TextStyle(color: Colors.grey[400]),
+                  ),
+                  onTap: () {
+                    setState(() {
+                      _ipController.text = 'http://${s.host}:${s.port}';
+                    });
+                    Navigator.pop(context); // Pop sheet
+                    Navigator.pop(
+                      context,
+                    ); // Pop settings (will be popped by _updateUrl logic if used there, but here we are in settings)
+                    // Actually we are called from settings dialog, so we need to handle that.
+                    // Let's just update controller and let user click Save.
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
     } catch (e) {
+      if (mounted) Navigator.pop(context);
       if (mounted) {
-        setState(() {
-          if (!silent) _error = e.toString();
-          _isLoading = false;
-        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Scan failed: $e')));
       }
     }
   }
 
   void _updateUrl() {
     _service = TelemetryService(baseUrl: _ipController.text);
-    _loadData();
+    _connectStream();
     Navigator.pop(context);
   }
 
   Future<void> _reboot() async {
-    final confirm = await _showConfirmation('Reboot System', 'Are you sure you want to reboot the Raspberry Pi?');
+    final confirm = await _showConfirmation(
+      'Reboot System',
+      'Are you sure you want to reboot the Raspberry Pi?',
+    );
     if (confirm == true) {
       try {
         await _service.rebootSystem();
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Reboot command sent')));
+        if (mounted)
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Reboot command sent')));
       } catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+          );
       }
     }
   }
 
   Future<void> _shutdown() async {
-    final confirm = await _showConfirmation('Shutdown System', 'Are you sure you want to shut down the Raspberry Pi?');
+    final confirm = await _showConfirmation(
+      'Shutdown System',
+      'Are you sure you want to shut down the Raspberry Pi?',
+    );
     if (confirm == true) {
       try {
         await _service.shutdownSystem();
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Shutdown command sent')));
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Shutdown command sent')),
+          );
       } catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+          );
       }
     }
   }
@@ -103,8 +249,14 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text(title, style: GoogleFonts.outfit(color: Colors.white)),
         content: Text(content, style: TextStyle(color: Colors.grey[400])),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Confirm', style: TextStyle(color: Colors.red))),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Confirm', style: TextStyle(color: Colors.red)),
+          ),
         ],
       ),
     );
@@ -122,12 +274,24 @@ class _HomeScreenState extends State<HomeScreen> {
           decoration: InputDecoration(
             labelText: 'API URL',
             labelStyle: TextStyle(color: Colors.grey[400]),
-            enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.grey[800]!)),
-            focusedBorder: const OutlineInputBorder(borderSide: BorderSide(color: Colors.blue)),
+            enabledBorder: OutlineInputBorder(
+              borderSide: BorderSide(color: Colors.grey[800]!),
+            ),
+            focusedBorder: const OutlineInputBorder(
+              borderSide: BorderSide(color: Colors.blue),
+            ),
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.search, color: Colors.blue),
+              onPressed: _scanForDevices,
+              tooltip: 'Scan for Devices',
+            ),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
           ElevatedButton(onPressed: _updateUrl, child: const Text('Save')),
         ],
       ),
@@ -138,19 +302,38 @@ class _HomeScreenState extends State<HomeScreen> {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1E1E1E),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
       builder: (context) => Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Power Controls', style: GoogleFonts.outfit(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+            Text(
+              'Power Controls',
+              style: GoogleFonts.outfit(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 24),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                _buildPowerButton('Reboot', Icons.restart_alt, Colors.orange, _reboot),
-                _buildPowerButton('Shutdown', Icons.power_settings_new, Colors.red, _shutdown),
+                _buildPowerButton(
+                  'Reboot',
+                  Icons.restart_alt,
+                  Colors.orange,
+                  _reboot,
+                ),
+                _buildPowerButton(
+                  'Shutdown',
+                  Icons.power_settings_new,
+                  Colors.red,
+                  _shutdown,
+                ),
               ],
             ),
             const SizedBox(height: 24),
@@ -160,7 +343,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildPowerButton(String label, IconData icon, Color color, VoidCallback onTap) {
+  Widget _buildPowerButton(
+    String label,
+    IconData icon,
+    Color color,
+    VoidCallback onTap,
+  ) {
     return InkWell(
       onTap: () {
         Navigator.pop(context);
@@ -178,7 +366,13 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Icon(icon, color: color, size: 32),
             const SizedBox(height: 8),
-            Text(label, style: GoogleFonts.outfit(color: color, fontWeight: FontWeight.w600)),
+            Text(
+              label,
+              style: GoogleFonts.outfit(
+                color: color,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ],
         ),
       ),
@@ -189,8 +383,9 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_previousData == null) return '0 KB/s';
     final diff = currentBytes - previousBytes;
     // Assuming 2 second interval roughly
-    final bytesPerSec = diff / 2; 
-    if (bytesPerSec > 1024 * 1024) return '${(bytesPerSec / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+    final bytesPerSec = diff / 2;
+    if (bytesPerSec > 1024 * 1024)
+      return '${(bytesPerSec / (1024 * 1024)).toStringAsFixed(1)} MB/s';
     return '${(bytesPerSec / 1024).toStringAsFixed(1)} KB/s';
   }
 
@@ -204,7 +399,13 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('System Telemetry', style: GoogleFonts.outfit(fontWeight: FontWeight.w600, color: Colors.white)),
+            Text(
+              'System Telemetry',
+              style: GoogleFonts.outfit(
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+              ),
+            ),
             if (_data != null)
               Text(
                 '${_data!.system.info.hostname} • ${_data!.system.info.ipAddress}',
@@ -213,8 +414,14 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.power_settings_new, color: Colors.redAccent), onPressed: _showControlPanel),
-          IconButton(icon: const Icon(Icons.settings, color: Colors.white), onPressed: _showSettingsDialog),
+          IconButton(
+            icon: const Icon(Icons.power_settings_new, color: Colors.redAccent),
+            onPressed: _showControlPanel,
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings, color: Colors.white),
+            onPressed: _showSettingsDialog,
+          ),
         ],
       ),
       body: _buildBody(),
@@ -222,7 +429,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildBody() {
-    if (_isLoading && _data == null) return const Center(child: CircularProgressIndicator());
+    if (_isLoading && _data == null)
+      return const Center(child: CircularProgressIndicator());
     if (_error != null && _data == null) {
       return Center(
         child: Column(
@@ -230,11 +438,21 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             const Icon(Icons.error_outline, color: Colors.red, size: 48),
             const SizedBox(height: 16),
-            Text('Connection Failed', style: GoogleFonts.outfit(color: Colors.white, fontSize: 20)),
+            Text(
+              'Connection Failed',
+              style: GoogleFonts.outfit(color: Colors.white, fontSize: 20),
+            ),
             const SizedBox(height: 8),
-            Text(_error!, style: TextStyle(color: Colors.grey[400]), textAlign: TextAlign.center),
+            Text(
+              _error!,
+              style: TextStyle(color: Colors.grey[400]),
+              textAlign: TextAlign.center,
+            ),
             const SizedBox(height: 24),
-            ElevatedButton(onPressed: () => _loadData(), child: const Text('Retry')),
+            ElevatedButton(
+              onPressed: _connectStream,
+              child: const Text('Retry'),
+            ),
           ],
         ),
       );
@@ -245,75 +463,146 @@ class _HomeScreenState extends State<HomeScreen> {
     final prev = _previousData ?? d;
 
     return RefreshIndicator(
-      onRefresh: () => _loadData(),
-      child: GridView.count(
-        crossAxisCount: 2,
+      onRefresh: () async {
+        _connectStream();
+      },
+      child: ListView(
         padding: const EdgeInsets.all(16),
-        mainAxisSpacing: 16,
-        crossAxisSpacing: 16,
-        childAspectRatio: 1.1,
         children: [
-          TelemetryCard(
-            title: 'CPU Temp',
-            value: d.cpu.temperatureCelsius.toStringAsFixed(1),
-            unit: '°C',
-            icon: Icons.thermostat,
-            color: _getCpuColor(d.cpu.temperatureCelsius),
-            progress: (d.cpu.temperatureCelsius / 85).clamp(0.0, 1.0),
+          GridView.count(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            crossAxisCount: 2,
+            mainAxisSpacing: 16,
+            crossAxisSpacing: 16,
+            childAspectRatio: 1.1,
+            children: [
+              TelemetryCard(
+                title: 'CPU Temp',
+                value: d.cpu.temperatureCelsius.toStringAsFixed(1),
+                unit: '°C',
+                icon: Icons.thermostat,
+                color: _getCpuColor(d.cpu.temperatureCelsius),
+                progress: (d.cpu.temperatureCelsius / 85).clamp(0.0, 1.0),
+              ),
+              TelemetryCard(
+                title: 'CPU Usage',
+                value: d.cpu.usagePercent.toStringAsFixed(1),
+                unit: '%',
+                icon: Icons.speed,
+                color: _getUsageColor(d.cpu.usagePercent),
+                progress: d.cpu.usagePercent / 100,
+              ),
+              TelemetryCard(
+                title: 'Memory Used',
+                value: d.memory.usedPercent.toStringAsFixed(1),
+                unit: '%',
+                icon: Icons.memory,
+                color: _getUsageColor(d.memory.usedPercent),
+                progress: d.memory.usedPercent / 100,
+              ),
+              TelemetryCard(
+                title: 'Disk Usage',
+                value: d.disk.percent.toStringAsFixed(1),
+                unit: '%',
+                icon: Icons.storage,
+                color: _getUsageColor(d.disk.percent),
+                progress: d.disk.percent / 100,
+                trailing: Text(
+                  '${d.disk.freeGb.toStringAsFixed(1)} GB Free',
+                  style: TextStyle(color: Colors.grey[500], fontSize: 10),
+                ),
+              ),
+              TelemetryCard(
+                title: 'Wi-Fi Signal',
+                value: d.wifi.signalLevelDbm.toString(),
+                unit: 'dBm',
+                icon: Icons.wifi,
+                color: _getWifiColor(d.wifi.signalLevelDbm),
+                progress: d.wifi.signalQualityPercent / 100,
+              ),
+              TelemetryCard(
+                title: 'Network Down',
+                value: _getNetworkSpeed(
+                  d.network.bytesRecv,
+                  prev.network.bytesRecv,
+                ).split(' ')[0],
+                unit: _getNetworkSpeed(
+                  d.network.bytesRecv,
+                  prev.network.bytesRecv,
+                ).split(' ')[1],
+                icon: Icons.download,
+                color: Colors.blue,
+              ),
+              TelemetryCard(
+                title: 'Uptime',
+                value: d.system.uptimeHours.toStringAsFixed(1),
+                unit: 'hrs',
+                icon: Icons.timer,
+                color: Colors.teal,
+              ),
+              TelemetryCard(
+                title: 'System Health',
+                value: d.system.throttling.isThrottled ? 'Issues' : 'Good',
+                unit: '',
+                icon: d.system.throttling.isThrottled
+                    ? Icons.warning
+                    : Icons.check_circle,
+                color: d.system.throttling.isThrottled
+                    ? Colors.red
+                    : Colors.green,
+              ),
+            ],
           ),
-          TelemetryCard(
-            title: 'CPU Usage',
-            value: d.cpu.usagePercent.toStringAsFixed(1),
-            unit: '%',
-            icon: Icons.speed,
-            color: _getUsageColor(d.cpu.usagePercent),
-            progress: d.cpu.usagePercent / 100,
+          const SizedBox(height: 24),
+          Text(
+            'History',
+            style: GoogleFonts.outfit(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
           ),
-          TelemetryCard(
-            title: 'Memory Used',
-            value: d.memory.usedPercent.toStringAsFixed(1),
-            unit: '%',
-            icon: Icons.memory,
-            color: _getUsageColor(d.memory.usedPercent),
-            progress: d.memory.usedPercent / 100,
-          ),
-          TelemetryCard(
-            title: 'Disk Usage',
-            value: d.disk.percent.toStringAsFixed(1),
-            unit: '%',
-            icon: Icons.storage,
-            color: _getUsageColor(d.disk.percent),
-            progress: d.disk.percent / 100,
-            trailing: Text('${d.disk.freeGb.toStringAsFixed(1)} GB Free', style: TextStyle(color: Colors.grey[500], fontSize: 10)),
-          ),
-          TelemetryCard(
-            title: 'Wi-Fi Signal',
-            value: d.wifi.signalLevelDbm.toString(),
-            unit: 'dBm',
-            icon: Icons.wifi,
-            color: _getWifiColor(d.wifi.signalLevelDbm),
-            progress: d.wifi.signalQualityPercent / 100,
-          ),
-          TelemetryCard(
-            title: 'Network Down',
-            value: _getNetworkSpeed(d.network.bytesRecv, prev.network.bytesRecv).split(' ')[0],
-            unit: _getNetworkSpeed(d.network.bytesRecv, prev.network.bytesRecv).split(' ')[1],
-            icon: Icons.download,
-            color: Colors.blue,
-          ),
-          TelemetryCard(
-            title: 'Uptime',
-            value: d.system.uptimeHours.toStringAsFixed(1),
-            unit: 'hrs',
-            icon: Icons.timer,
-            color: Colors.teal,
-          ),
-          TelemetryCard(
-            title: 'System Health',
-            value: d.system.throttling.isThrottled ? 'Issues' : 'Good',
-            unit: '',
-            icon: d.system.throttling.isThrottled ? Icons.warning : Icons.check_circle,
-            color: d.system.throttling.isThrottled ? Colors.red : Colors.green,
+          const SizedBox(height: 16),
+          SizedBox(
+            height: 200,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                SizedBox(
+                  width: 300,
+                  child: HistoryGraph(
+                    title: 'CPU Usage',
+                    dataPoints: _cpuHistory,
+                    color: Colors.blue,
+                    maxY: 100,
+                    unit: '%',
+                  ),
+                ),
+                const SizedBox(width: 16),
+                SizedBox(
+                  width: 300,
+                  child: HistoryGraph(
+                    title: 'Memory Usage',
+                    dataPoints: _memoryHistory,
+                    color: Colors.purple,
+                    maxY: 100,
+                    unit: '%',
+                  ),
+                ),
+                const SizedBox(width: 16),
+                SizedBox(
+                  width: 300,
+                  child: HistoryGraph(
+                    title: 'CPU Temp',
+                    dataPoints: _tempHistory,
+                    color: Colors.orange,
+                    maxY: 100,
+                    unit: '°C',
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
